@@ -5,6 +5,7 @@
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include <time.h>
 
 //*************************************************
 // Configuration
@@ -17,6 +18,11 @@
 #define MQTT_TOPIC      "localization/rssi"
 
 #define MIN_RSSI        -80
+
+// NTP Configuration
+#define NTP_SERVER      "pool.ntp.org"
+#define GMT_OFFSET_SEC  3600   // Italy: GMT+1 (Central European Time)
+#define DAYLIGHT_OFFSET_SEC 3600  // Italy: +1 hour for daylight saving time (CEST)
 
 // BLE MAC addresses of interest
 String addrList[] = {
@@ -38,6 +44,37 @@ WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
 //*************************************************
+// NTP Time Functions
+//*************************************************
+void initNTP() {
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+  Serial.println("Waiting for NTP time synchronization...");
+  
+  time_t now = time(nullptr);
+  int attempts = 0;
+  while (now < 8 * 3600 * 2 && attempts < 50) { // Wait up to 50 seconds
+    delay(1000);
+    Serial.print(".");
+    now = time(nullptr);
+    attempts++;
+  }
+  
+  if (now > 8 * 3600 * 2) {
+    Serial.println("\nNTP synchronized successfully!");
+    Serial.print("Current time: ");
+    Serial.println(ctime(&now));
+  } else {
+    Serial.println("\nWarning: NTP synchronization failed!");
+  }
+}
+
+unsigned long getTimestampMs() {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (unsigned long)(tv.tv_sec) * 1000 + (tv.tv_usec / 1000);
+}
+
+//*************************************************
 // BLE Device Callback
 //*************************************************
 class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
@@ -47,8 +84,9 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
 
     for (int j = 0; j < sizeof(addrList) / sizeof(addrList[0]); j++) {
       if (rssi >= MIN_RSSI && addrList[j].equalsIgnoreCase(addr)) {
-        char payload[100];
-        snprintf(payload, sizeof(payload), "%s,%d", addr.c_str(), rssi);
+        unsigned long timestamp = getTimestampMs();
+        char payload[150];
+        snprintf(payload, sizeof(payload), "%s,%d,%lu", addr.c_str(), rssi, timestamp);
         mqttClient.publish(MQTT_TOPIC, payload);
         break;
       }
@@ -96,6 +134,9 @@ void setup() {
   Serial.begin(115200);
   connectToWiFi();
 
+  // Initialize NTP after WiFi connection
+  initNTP();
+
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
   connectToMQTT();
 
@@ -112,12 +153,24 @@ void setup() {
 // Loop
 //*************************************************
 void loop() {
+  static unsigned long lastNtpSync = 0;
+  const unsigned long NTP_SYNC_INTERVAL = 3600000; // Resync every hour (3600000 ms)
+  
   if (WiFi.status() != WL_CONNECTED) {
     connectToWiFi();
+    initNTP(); // Re-initialize NTP after WiFi reconnection
   }
 
   if (!mqttClient.connected()) {
     connectToMQTT();
+  }
+
+  // Periodic NTP resynchronization
+  unsigned long currentTime = millis();
+  if (currentTime - lastNtpSync > NTP_SYNC_INTERVAL) {
+    Serial.println("Performing periodic NTP resync...");
+    initNTP();
+    lastNtpSync = currentTime;
   }
 
   mqttClient.loop(); // Maintain MQTT connection
