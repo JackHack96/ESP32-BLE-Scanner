@@ -5,9 +5,10 @@
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
-
 #include <NTPClient.h>
 #include <WiFiUdp.h>
+#include <esp_wifi.h>
+#include <esp_bt.h>
 
 //*************************************************
 // Configuration
@@ -44,6 +45,24 @@ PubSubClient mqttClient(espClient);
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP);
 
+// RSSI Averaging and Beacon Tracking
+#define MAX_BEACONS 10
+#define RSSI_SAMPLES 5
+#define PUBLISH_INTERVAL_MS 1000
+
+struct BeaconData {
+  String address;
+  int rssiBuffer[RSSI_SAMPLES];
+  int bufferIndex;
+  int sampleCount;
+  unsigned long lastSeen;
+  unsigned long lastPublished;
+  bool isActive;
+};
+
+BeaconData beacons[MAX_BEACONS];
+int beaconCount = 0;
+
 //*************************************************
 // NTP Time Functions
 //*************************************************
@@ -66,8 +85,87 @@ void initNTP() {
   Serial.println(timeClient.getFormattedTime());
 }
 
-inline unsigned long getTimestampMs() {
+inline unsigned long getTimestamp() {
   return timeClient.getEpochTime();
+}
+
+//*************************************************
+// RSSI Averaging Functions
+//*************************************************
+int findOrCreateBeacon(const String& address) {
+  // Find existing beacon
+  for (int i = 0; i < beaconCount; i++) {
+    if (beacons[i].address == address) {
+      return i;
+    }
+  }
+  
+  // Create new beacon if space available
+  if (beaconCount < MAX_BEACONS) {
+    int index = beaconCount++;
+    beacons[index].address = address;
+    beacons[index].bufferIndex = 0;
+    beacons[index].sampleCount = 0;
+    beacons[index].lastSeen = millis();
+    beacons[index].lastPublished = 0;
+    beacons[index].isActive = true;
+    return index;
+  }
+  
+  return -1; // No space available
+}
+
+void addRSSISample(int beaconIndex, int rssi) {
+  BeaconData& beacon = beacons[beaconIndex];
+  beacon.rssiBuffer[beacon.bufferIndex] = rssi;
+  beacon.bufferIndex = (beacon.bufferIndex + 1) % RSSI_SAMPLES;
+  if (beacon.sampleCount < RSSI_SAMPLES) {
+    beacon.sampleCount++;
+  }
+  beacon.lastSeen = millis();
+}
+
+int getAverageRSSI(int beaconIndex) {
+  BeaconData& beacon = beacons[beaconIndex];
+  if (beacon.sampleCount == 0) return -100;
+  
+  long sum = 0;
+  for (int i = 0; i < beacon.sampleCount; i++) {
+    sum += beacon.rssiBuffer[i];
+  }
+  return sum / beacon.sampleCount;
+}
+
+void publishBeaconData() {
+  unsigned long currentTime = millis();
+  
+  for (int i = 0; i < beaconCount; i++) {
+    BeaconData& beacon = beacons[i];
+    
+    // Skip if not enough samples or published recently
+    if (beacon.sampleCount < 3 || 
+        (currentTime - beacon.lastPublished) < PUBLISH_INTERVAL_MS) {
+      continue;
+    }
+    
+    // Check if beacon is still active (seen within last 5 seconds)
+    if ((currentTime - beacon.lastSeen) > 5000) {
+      beacon.isActive = false;
+      continue;
+    }
+    
+    int avgRSSI = getAverageRSSI(i);
+    if (avgRSSI >= MIN_RSSI) {
+      unsigned long timestamp = getTimestamp();
+      char payload[150];
+      snprintf(payload, sizeof(payload), "%s,%d,%lu", 
+               beacon.address.c_str(), avgRSSI, timestamp);
+      
+      if (mqttClient.publish(MQTT_TOPIC, payload)) {
+        beacon.lastPublished = currentTime;
+      }
+    }
+  }
 }
 
 //*************************************************
@@ -76,15 +174,22 @@ inline unsigned long getTimestampMs() {
 class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice device) {
     String addr = device.getAddress().toString().c_str();
+    addr.toLowerCase(); // Normalize to lowercase
     int rssi = device.getRSSI();
 
+    // Check if this is a target device
+    bool isTargetDevice = false;
     for (int j = 0; j < sizeof(addrList) / sizeof(addrList[0]); j++) {
-      if (rssi >= MIN_RSSI && addrList[j].equalsIgnoreCase(addr)) {
-        unsigned long timestamp = getTimestampMs();
-        char payload[150];
-        snprintf(payload, sizeof(payload), "%s,%d,%lu", addr.c_str(), rssi, timestamp);
-        mqttClient.publish(MQTT_TOPIC, payload);
+      if (addrList[j].equalsIgnoreCase(addr)) {
+        isTargetDevice = true;
         break;
+      }
+    }
+    
+    if (isTargetDevice && rssi >= MIN_RSSI) {
+      int beaconIndex = findOrCreateBeacon(addr);
+      if (beaconIndex >= 0) {
+        addRSSISample(beaconIndex, rssi);
       }
     }
   }
@@ -128,6 +233,14 @@ void connectToMQTT() {
 //*************************************************
 void setup() {
   Serial.begin(115200);
+  
+  // Initialize beacon tracking
+  beaconCount = 0;
+  
+  // Configure WiFi/BLE coexistence
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM); // Minimize WiFi power saving for better coexistence
+  
   connectToWiFi();
 
   // Initialize NTP after WiFi connection
@@ -136,12 +249,23 @@ void setup() {
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
   connectToMQTT();
 
+  // Configure BLE with coexistence settings
   BLEDevice::init("");
+  
+  // Set BLE power to reduce interference
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P3); // +3dBm
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P3);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, ESP_PWR_LVL_P3);
+  
   BLEScan* pBLEScan = BLEDevice::getScan();
-  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks(), true); // Want duplicates
-  pBLEScan->setInterval(160);  // 160 * 0.625ms = 100ms interval - faster scanning
-  pBLEScan->setWindow(160);    // 160 * 0.625ms = 100ms scan window - continuous
-  pBLEScan->setActiveScan(true);
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks(), true);
+  
+  // Optimize scan parameters for coexistence
+  pBLEScan->setInterval(200);  // 200 * 0.625ms = 125ms interval
+  pBLEScan->setWindow(100);    // 100 * 0.625ms = 62.5ms scan window (50% duty cycle)
+  pBLEScan->setActiveScan(false); // Passive scanning reduces interference
+  
+  Serial.println("Starting BLE scan with WiFi coexistence...");
   pBLEScan->start(0, nullptr, false); // Continuous scanning
 }
 
@@ -149,19 +273,41 @@ void setup() {
 // Loop
 //*************************************************
 void loop() {
- if (WiFi.status() != WL_CONNECTED) {
-    connectToWiFi();
-    initNTP(); // Re-initialize NTP after WiFi reconnection
+  static unsigned long lastWiFiCheck = 0;
+  static unsigned long lastNTPUpdate = 0;
+  static unsigned long lastBeaconPublish = 0;
+  
+  unsigned long currentTime = millis();
+  
+  // Check WiFi connection every 5 seconds
+  if (currentTime - lastWiFiCheck > 5000) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi disconnected, reconnecting...");
+      connectToWiFi();
+      initNTP(); // Re-initialize NTP after WiFi reconnection
+    }
+    lastWiFiCheck = currentTime;
   }
 
+  // Check MQTT connection
   if (!mqttClient.connected()) {
     connectToMQTT();
   }
 
-  while(!timeClient.update()) {
-    timeClient.forceUpdate();
+  // Update NTP every 30 seconds (less frequent to reduce interference)
+  if (currentTime - lastNTPUpdate > 30000) {
+    timeClient.update();
+    lastNTPUpdate = currentTime;
+  }
+  
+  // Publish beacon data every 500ms
+  if (currentTime - lastBeaconPublish > 500) {
+    publishBeaconData();
+    lastBeaconPublish = currentTime;
   }
 
   mqttClient.loop(); // Maintain MQTT connection
-  delay(1); // Minimal delay for better responsiveness
+  
+  // Longer delay to give more time for BLE scanning
+  delay(10);
 }
